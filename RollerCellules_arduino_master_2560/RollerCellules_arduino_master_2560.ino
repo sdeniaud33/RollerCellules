@@ -34,8 +34,8 @@ enum modeEnum {
   modeKoSystem
 };
 
-modeEnum currentMode = modeCalibrating;
-//modeEnum currentMode = modeWaitingForSlave;
+//modeEnum currentMode = modeCalibrating;
+modeEnum currentMode = modeWaitingForSlave;
 
 enum cellStatusEnum {
   statusUnknown,
