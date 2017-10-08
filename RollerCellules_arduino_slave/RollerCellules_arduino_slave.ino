@@ -36,7 +36,7 @@ void setup() {
   pinMode(PIN_CELL, INPUT);
   Serial.println("Starting...");
   // Make sure the led is off
-  digitalWrite(PIN_LED, HIGH);
+  digitalWrite(PIN_LED, LOW);
   defaultCellValue = readCellValue();
   // Switch on the led
   digitalWrite(PIN_LED, HIGH);
