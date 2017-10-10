@@ -11,6 +11,8 @@
 #define serialBluetooth Serial1
 #define serialMp3 Serial2
 
+#define SLAVE_CELLS_COUNT 2
+
 // *******************************************************
 // **
 // ** PIN DECLARATIONS
@@ -22,7 +24,7 @@
 #define PIN_RADIO_CSN 10               // radio module : CSN pin
 
 #define PIN_OUT_LED_SLAVE_HEARTBEAT 11 // led that will blink each time a heartbeat is received from the salve module
-#define PIN_OUT_SLAVE_CELL_STATUS 12   // led that reflects the slave cell status (on = free, off = obstacle)
+const byte PIN_OUT_SLAVE_CELL_STATUS[SLAVE_CELLS_COUNT] = {12, 14};   // leds that reflects the slave cell status (on = free, off = obstacle)
 #define PIN_OUT_MASTER_CELL_STATUS 13  // led that reflects the master cell status (on = free, off = obstacle)
 #define PIN_BTN_MODE 25                // button to switch modes
 #define PIN_BTN_RESET 26               // hardware only : not used directly in the code 
@@ -34,16 +36,44 @@
 
 // *******************************************************
 // **
+// ** RADIO MESSAGES
+// **
+// *******************************************************
+const byte RADIO_MSG_MASTER_HEARTBEAT = 1;
+const byte RADIO_MSG_SLAVE_HEARTBEAT = 2;
+const byte RADIO_MSG_SLAVE_CELL_FREE[SLAVE_CELLS_COUNT] = {3, 4};
+const byte RADIO_MSG_SLAVE_CELL_OBSTACLE[SLAVE_CELLS_COUNT] = {5, 6};
+const byte RADIO_MSG_MASTER_MODE_DIAGNOSE = 7;
+const byte RADIO_MSG_MASTER_MODE_FREESTART = 8;
+const byte RADIO_MSG_MASTER_MODE_KO_SYSTEM_SINGLE = 9;
+const byte RADIO_MSG_MASTER_MODE_KO_SYSTEM_DUEL = 10;
+
+// *******************************************************
+// **
+// ** BLUETOOTH MESSAGES
+// **
+// *******************************************************
+const String BLUETOOTH_MSG_START = "<start>";
+const String BLUETOOTH_MSG_STOP = "<stop>";
+const String BLUETOOTH_MSG_CALIBRATE = "<calibrate>";
+const String BLUETOOTH_MSG_FREE_START = "<freestart>";
+const String BLUETOOTH_MSG_KO_SYSTEM = "<kosystem>";
+const String BLUETOOTH_MSG_KO_SYSTEM_DUEL = "<kosystemduel>";
+
+// *******************************************************
+// **
 // ** OTHER DECLARATIONS
 // **
 // *******************************************************
 
+const int HEARTBEAT_PERIOD = 500;
 const int MP3_ID_ON_YOUR_MARKS_SET = 2;
 const int MP3_ID_GO = 1;
 DFRobotDFPlayerMini myDFPlayer;
 
 bool evenSlaveHeartbeat = false;       // even / odd flag toggled each time a heartbeat is received from the slave module
 SimpleTimer koSystemStartTimer;
+byte slaveCellsCountInUse = 1;
 
 // Enum for the status of the module (master module)
 enum modeEnum {
@@ -51,7 +81,8 @@ enum modeEnum {
   modeWaitingForSlave,      // waiting for the first heartbeat from then slave module
   modeDiagnose,             // diagnosis : mainly show cells alignments
   modeFreeStart,            // 'free start' mode
-  modeKoSystem              // 'k.o system' mode
+  modeKoSystem,             // 'k.o system' mode
+  modeKoSystemDuel          // 'k.o system' mode (duel)
 };
 
 modeEnum currentMode;
@@ -67,16 +98,17 @@ enum slaveStatusEnum {
   statusOffline
 };
 
-bool isRunning = false;
+bool isRunning[SLAVE_CELLS_COUNT] = {false, false};
 bool isStartingKoSsytem = false;
 cellStatusEnum lastMasterCellStatus = statusUnknown;
 cellStatusEnum masterCellStatus = statusUnknown;
-cellStatusEnum slaveCellStatus = statusUnknown;
+cellStatusEnum slaveCellStatus[SLAVE_CELLS_COUNT] = {statusUnknown, statusUnknown};
 slaveStatusEnum slaveStatus = statusOffline;
 
+unsigned long masterLastHeartBeatTime = 0;
 unsigned long lastSlaveHeartbeatMillis = 0;
 long slaveHeartbeatTimeToLive = 1200;
-long runningDuration;
+long runningDuration[SLAVE_CELLS_COUNT];
 unsigned long runningStartTime;
 const int CELL_VALUE_DELTA = 30;
 int defaultCellValue;
@@ -121,7 +153,9 @@ void setup() {
 
   // ----- Initialization of the cells
   pinMode(PIN_OUT_LED_SLAVE_HEARTBEAT, OUTPUT);
-  pinMode(PIN_OUT_SLAVE_CELL_STATUS, OUTPUT);
+  for (int cellId = 0; cellId < SLAVE_CELLS_COUNT; cellId++) {
+    pinMode(PIN_OUT_SLAVE_CELL_STATUS[cellId], OUTPUT);
+  }
   pinMode(PIN_OUT_MASTER_CELL_STATUS, OUTPUT);
   pinMode(PIN_IN_ANALOG_LDR, INPUT);
   pinMode(PIN_OUT_LASER, OUTPUT);
@@ -161,12 +195,85 @@ void setup() {
 
 }
 
+// *******************************************************
+// **
+// ** RADIO
+// **
+// *******************************************************
+void sendRadioMessageToSlave(byte value) {
+  byte message[1];
+  message[0] = value;
+  Mirf.send(message);
+  while (Mirf.isSending());
+}
+
+void sendRadioHeartBeatIfNeeded() {
+  unsigned long now = millis();
+  if (now - masterLastHeartBeatTime > HEARTBEAT_PERIOD) {
+    sendRadioMessageToSlave(RADIO_MSG_MASTER_HEARTBEAT);
+    masterLastHeartBeatTime = now;
+    Serial.println("hb sent");
+  }
+}
+
+/*
+   Read incoming data from the radio module (receive data from the slave module)
+*/
+void readFromRadio() {
+  byte message[1];
+  if (!Mirf.isSending() && Mirf.dataReady()) {
+    Mirf.getData(message);
+    byte radioMsg = message[0];
+    if (radioMsg == RADIO_MSG_SLAVE_HEARTBEAT) {
+      // heartbeat from slave
+      Serial.println("<hb_slave>");
+      evenSlaveHeartbeat = !evenSlaveHeartbeat;
+      digitalWrite(PIN_OUT_LED_SLAVE_HEARTBEAT, evenSlaveHeartbeat ? HIGH : LOW);
+      lastSlaveHeartbeatMillis = millis();
+      if (currentMode == modeWaitingForSlave) {
+        // End of init : start the calibration
+        currentMode = modeDiagnose;
+        initNewModeDisplay();
+      }
+    }
+    else if (radioMsg >= RADIO_MSG_SLAVE_CELL_FREE[0] && radioMsg <= RADIO_MSG_SLAVE_CELL_FREE[SLAVE_CELLS_COUNT]) {
+      // slave cell status = free
+      byte cellId = radioMsg - RADIO_MSG_SLAVE_CELL_FREE[0];
+      slaveCellStatus[cellId] = statusFree;
+      digitalWrite(PIN_OUT_SLAVE_CELL_STATUS[cellId], HIGH);
+      if (currentMode == modeDiagnose)
+        updateCurrentModeDisplay();
+      Serial.print("free #");
+      Serial.println(cellId);
+    }
+    else if (radioMsg >= RADIO_MSG_SLAVE_CELL_OBSTACLE[0] && radioMsg <= RADIO_MSG_SLAVE_CELL_OBSTACLE[SLAVE_CELLS_COUNT]) {
+      // slave cell status = obstacle
+      byte cellId = radioMsg - RADIO_MSG_SLAVE_CELL_OBSTACLE[0];
+      digitalWrite(PIN_OUT_SLAVE_CELL_STATUS[cellId], LOW);
+      slaveCellStatus[cellId] = statusObstacle;
+      if (isRunning[cellId])
+        stopChrono(cellId);
+      else if (currentMode == modeDiagnose)
+        updateCurrentModeDisplay();
+      Serial.print("obstacle #");
+      Serial.println(cellId);
+    }
+  }
+}
+
+// *******************************************************
+// **
+// ** DISPLAY
+// **
+// *******************************************************
 /*
    Inits the display for a new mode (should be invoked everytime currentMode is changed) - 1st line of the LCD
 */
 void initNewModeDisplay() {
   isStartingKoSsytem = false;
-  isRunning = false;
+  for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+    isRunning[cellId] = false;
+  }
   lcd.clear();
   switch (currentMode) {
     case modeWaitingForMp3:
@@ -180,16 +287,25 @@ void initNewModeDisplay() {
       break;
     case modeDiagnose:
       lcd.print(" - DIAGNOSIS -  ");
+      sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_DIAGNOSE);
       break;
     case modeFreeStart:
       lcd.print(" - FREE START - ");
       lcd.setCursor(0, 1);
       lcd.print("Ready ...");
+      sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_FREESTART);
       break;
     case modeKoSystem:
       lcd.print(" - K.O SYSTEM - ");
       lcd.setCursor(0, 1);
       lcd.print("Ready ...");
+      sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_KO_SYSTEM_SINGLE);
+      break;
+    case modeKoSystemDuel:
+      lcd.print("  - K.O DUEL -  ");
+      lcd.setCursor(0, 1);
+      lcd.print("Ready ...");
+      sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_KO_SYSTEM_DUEL);
       break;
   }
 }
@@ -221,21 +337,33 @@ void updateCurrentModeDisplay() {
   if (currentMode == modeDiagnose) {
     lcd.print(cellStatusToChar(masterCellStatus));
     lcd.print(" -> ");
-    lcd.print(cellStatusToChar(slaveCellStatus));
+    for (int cellId = 0; cellId < SLAVE_CELLS_COUNT; cellId++) {
+      if (cellId > 0)
+        lcd.print(" / ");
+      lcd.print(cellStatusToChar(slaveCellStatus[cellId]));
+    }
   }
   else {
-    if (isRunning) {
-      float f = runningDuration;
-      f = f / 1000;
-      lcd.print(f, 3);
-      lcd.print(" s");
-    }
-    else {
-      // Leave the last duration displayed so that the runner can see its time :)
+    for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+
+      if (isRunning[cellId]) {
+        float f = runningDuration[cellId];
+        f = f / 1000;
+        lcd.print(f, 3);
+        lcd.print(" s");
+      }
+      else {
+        // Leave the last duration displayed so that the runner can see its time :)
+      }
     }
   }
 }
 
+// *******************************************************
+// **
+// ** BUTTONS
+// **
+// *******************************************************
 /*
    This callback is invoked everytime the 'mode' button is clicked
 */
@@ -250,21 +378,43 @@ void onClickBtnMode() {
     currentMode = modeFreeStart;
   else if (currentMode == modeFreeStart)
     currentMode = modeKoSystem;
-  else if (currentMode == modeKoSystem)
-    currentMode = modeDiagnose;
-  else
-    return;
+  else {
+    if (SLAVE_CELLS_COUNT > 1) {
+      // 2 slave cells
+      if (currentMode == modeKoSystem)
+        currentMode = modeKoSystemDuel;
+      else if (currentMode == modeKoSystemDuel)
+        currentMode = modeDiagnose;
+      else
+        return;
+    }
+    else {
+      // Only 1 slave cell
+      if (currentMode == modeKoSystem)
+        currentMode = modeDiagnose;
+      else
+        return;
+    }
+  }
   initNewModeDisplay();
 }
 
+// *******************************************************
+// **
+// ** CHRONOS
+// **
+// *******************************************************
 /*
-   Starts the chrono in 'ko system' mode
+   Starts the chrono in 'ko system' mode (single or duel)
 */
 void startKoSystem() {
   if (isStartingKoSsytem)
     return;
-  if (isRunning)
-    return;
+  for (int cellId = 0; cellId < SLAVE_CELLS_COUNT; cellId++) {
+    if (isRunning[cellId])
+      return;
+  }
+
   isStartingKoSsytem = true;
   Serial.println("Start KO system");
   // Play the "on your marks .. set ..." mp3 file
@@ -291,6 +441,15 @@ void startKoSystemStepGo() {
   }
   // Play the "go !!!" mp3 file
   myDFPlayer.play(MP3_ID_GO);
+  if (currentMode == modeKoSystem) {
+    slaveCellsCountInUse = 1;
+  } else if (currentMode == modeKoSystemDuel) {
+    slaveCellsCountInUse = SLAVE_CELLS_COUNT;
+
+  }
+  for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+    isRunning[cellId] = true;
+  }
   startChrono();
 }
 
@@ -301,6 +460,8 @@ void startFreeStart() {
   if (isStartingKoSsytem)
     return;
   Serial.println("Start Free start");
+  slaveCellsCountInUse = 1;
+  isRunning[0] = true;
   startChrono();
 }
 
@@ -309,9 +470,10 @@ void startFreeStart() {
 */
 void startChrono() {
   isStartingKoSsytem = false;
-  isRunning = true;
   runningStartTime = millis();
-  runningDuration = 0;
+  for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+    runningDuration[cellId] = 0;
+  }
   lcd.setCursor(0, 1);
   lcd.print("                ");
   updateCurrentModeDisplay();
@@ -320,27 +482,37 @@ void startChrono() {
 /*
    Stops the chrono
 */
-void stopChrono() {
-  isRunning = false;
+void stopChrono(byte cellId) {
+  isRunning[cellId] = false;
   Serial.println("Stop chrono");
   updateCurrentModeDisplay();
-  float f = runningDuration;
+  float f = runningDuration[cellId];
   f = f / 1000;
   serialBluetooth.print(f, 3);
 }
 
 void tick() {
   unsigned long now = millis();
-  if (isRunning) {
-    runningDuration = (now - runningStartTime) * 1.009; // 1 < x < 1.010
-    updateCurrentModeDisplay();
+  bool atLeastOneRunning = false;
+  for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+    if (isRunning[cellId]) {
+      runningDuration[cellId] = (now - runningStartTime) * 1.009; // 1 < x < 1.010
+      atLeastOneRunning = true;
+    }
   }
-  if (currentMode == modeDiagnose) {
+  if (atLeastOneRunning)
+    updateCurrentModeDisplay();
+  else if (currentMode == modeDiagnose) {
     updateCurrentModeDisplay();
   }
   slaveStatus = (now - lastSlaveHeartbeatMillis) < slaveHeartbeatTimeToLive ? statusOnline : statusOffline;
 }
 
+// *******************************************************
+// **
+// ** CELLS
+// **
+// *******************************************************
 int readCellValue() {
   return analogRead(PIN_IN_ANALOG_LDR);
 }
@@ -363,21 +535,31 @@ void checkMasterCellStatus() {
 
   lastMasterCellStatus = masterCellStatus;
 
-  if (isRunning) {
-    // should not happen .... never knows
-    return;
+  for (int cellId = 0; cellId < SLAVE_CELLS_COUNT; cellId++) {
+    if (isRunning[cellId]) {
+      // should not happen .... never knows
+      return;
+    }
   }
   if (masterCellStatus == statusObstacle) {
     // The beam has been interrupted
-    if (currentMode == modeKoSystem) {
-      startKoSystem();
-    }
-    else if (currentMode == modeFreeStart) {
-      startFreeStart();
+    switch (currentMode) {
+      case modeKoSystem:
+      case modeKoSystemDuel:
+        startKoSystem();
+        break;
+      case modeFreeStart:
+        startFreeStart();
+        break;
     }
   }
 }
 
+// *******************************************************
+// **
+// ** BLUETOOTH
+// **
+// *******************************************************
 
 /*
    Read incoming data from bluetooth
@@ -399,27 +581,38 @@ void readFromBluetooth() {
     str.remove(str.length() - 1, 1);
   }
 
-  if (str.equals("<start>")) {
+  if (str.equals(BLUETOOTH_MSG_START)) {
     Serial.println("Start");
-    if (currentMode == modeFreeStart)
-      startFreeStart();
-    else if (currentMode == modeKoSystem)
-      startKoSystem();
+    switch (currentMode) {
+      case modeFreeStart:
+        startFreeStart();
+        break;
+      case modeKoSystem:
+      case modeKoSystemDuel:
+        startKoSystem();
+        break;
+    }
   }
-  else if (str.equals("<stop>")) {
+  else if (str.equals(BLUETOOTH_MSG_STOP)) {
     Serial.println("Stop");
-    stopChrono();
+    for (int cellId = 0; cellId < slaveCellsCountInUse; cellId++) {
+      stopChrono(cellId);
+    }
   }
-  else if (str.equals("<calibrate>")) {
+  else if (str.equals(BLUETOOTH_MSG_CALIBRATE)) {
     currentMode = modeDiagnose;
     initNewModeDisplay();
   }
-  else if (str.equals("<freestart>")) {
+  else if (str.equals(BLUETOOTH_MSG_FREE_START)) {
     currentMode = modeFreeStart;
     initNewModeDisplay();
   }
-  else if (str.equals("<kosystem>")) {
+  else if (str.equals(BLUETOOTH_MSG_KO_SYSTEM)) {
     currentMode = modeKoSystem;
+    initNewModeDisplay();
+  }
+  else if (str.equals(BLUETOOTH_MSG_KO_SYSTEM_DUEL)) {
+    currentMode = modeKoSystemDuel;
     initNewModeDisplay();
   }
   else {
@@ -427,45 +620,11 @@ void readFromBluetooth() {
   }
 }
 
-/*
-   Read incoming data from the radio module (receive data from the slave module)
-*/
-void readFromRadio() {
-  byte message[1];
-  if (!Mirf.isSending() && Mirf.dataReady()) {
-    Mirf.getData(message);
-    switch (message[0]) {
-      case 1 : // heartbeat
-        Serial.println("<hb_slave>");
-        evenSlaveHeartbeat = !evenSlaveHeartbeat;
-        digitalWrite(PIN_OUT_LED_SLAVE_HEARTBEAT, evenSlaveHeartbeat ? HIGH : LOW);
-        lastSlaveHeartbeatMillis = millis();
-        if (currentMode == modeWaitingForSlave) {
-          // End of init : start the calibration
-          currentMode = modeDiagnose;
-          initNewModeDisplay();
-        }
-        break;
-      case 3 : // slave cell status = free
-        slaveCellStatus = statusFree;
-        digitalWrite(PIN_OUT_SLAVE_CELL_STATUS, HIGH);
-        if (currentMode == modeDiagnose)
-          updateCurrentModeDisplay();
-        Serial.println("<free>");
-        break;
-      case 4 : // slave cell status = obstacle
-        Serial.println("<obstacle>");
-        digitalWrite(PIN_OUT_SLAVE_CELL_STATUS, LOW);
-        slaveCellStatus = statusObstacle;
-        if (isRunning)
-          stopChrono();
-        else if (currentMode == modeDiagnose)
-          updateCurrentModeDisplay();
-        break;
-    }
-  }
-}
-
+// *******************************************************
+// **
+// ** MP3
+// **
+// *******************************************************
 void printDetailFromMp3Player(uint8_t type, int value) {
   Serial.print("Output from MP3 player : ");
   switch (type) {
@@ -521,11 +680,14 @@ void printDetailFromMp3Player(uint8_t type, int value) {
       break;
   }
 }
-/*
-   Main loop
-*/
+
+// *******************************************************
+// **
+// ** LOOP
+// **
+// *******************************************************
 void loop() {
-  //  readFromArduinoRadio();
+  sendRadioHeartBeatIfNeeded();
   readFromBluetooth();
   readFromRadio();
   tick();
