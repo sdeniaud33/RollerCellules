@@ -1,0 +1,7 @@
+{
+    "port": "COM7",
+    "board": "arduino:avr:pro",
+    "configuration": "cpu=16MHzatmega328",
+    "sketch": "RollerCellules_arduino_slave.ino",
+	"output": "./.build"
+}

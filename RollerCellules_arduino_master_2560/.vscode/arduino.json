@@ -1,0 +1,7 @@
+{
+    "port": "COM16",
+    "board": "arduino:avr:mega",
+    "configuration": "cpu=atmega2560",
+	"sketch": "RollerCellules_arduino_master_2560.ino",
+	"output": "./.build"
+}
