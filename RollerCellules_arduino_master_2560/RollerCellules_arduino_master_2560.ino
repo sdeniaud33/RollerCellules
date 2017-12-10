@@ -191,12 +191,14 @@ void setup()
 	myDFPlayer.enableDAC();
 	Serial.println("mp3.setVolume");
 	myDFPlayer.volume(30); //Set volume value. From 0 to 30
+    Serial.println("mp3.play ready");
 	myDFPlayer.play(MP3_ID_SYSTEM_READY);
 
 	// ----- Initialization other stuff
 	btnMode.attachClick(onClickBtnMode);
 
 	currentMode = modeDiagnose;
+    Serial.println("ready to display");
 	initNewModeDisplay();
 
 	Serial.println("Ready");
@@ -321,7 +323,7 @@ void initNewModeDisplay()
 		break;
 	case modeDiagnose:
 		lcd.print(" -DIAGNOSIS-  ");
-		sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_DIAGNOSE);
+		//sendRadioMessageToSlave(RADIO_MSG_MASTER_MODE_DIAGNOSE);
 		break;
 	case modeFreeStart:
 		lcd.print(" -FREE START- ");
