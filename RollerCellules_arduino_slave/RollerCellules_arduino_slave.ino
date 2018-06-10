@@ -1,23 +1,33 @@
-#include <SPI.h>      // Pour la communication via le port SPI
-#include <Mirf.h>     // Pour la gestion de la communication
-#include <nRF24L01.h> // Pour les définitions des registres du nRF24L01
-#include <MirfHardwareSpiDriver.h> // Pour la communication SPI
+#define SLAVE_ID 0
 
-#define SLAVE_ID 1
+// Enable debug prints
+// #define MY_DEBUG
+// #define MY_DEBUG_VERBOSE
+// #define MY_DEBUG_VERBOSE_RF24
+
+// Enable and select radio type attached
+#define MY_RADIO_NRF24
+#define MY_RF24_PA_LEVEL RF24_PA_LOW
+
+//#define MY_RADIO_RFM69
+//#define MY_RS485
+
+#include <SPI.h> // Pour la communication via le port SPI
+#include <MySensors.h>
+#include <nRF24L01.h> // Pour les définitions des registres du nRF24L01
+
+#define MY_NODE_ID 1+SLAVE_ID
 
 // *******************************************************
 // **
 // ** RADIO MESSAGES
 // **
 // *******************************************************
-const byte RADIO_MSG_MASTER_HEARTBEAT = 1;
+const byte RADIO_MSG_RESET[2] = {10, 11};
+const byte RADIO_MSG_SET_THRESHOLD[2] = {8, 9};
 const byte RADIO_MSG_SLAVE_HEARTBEAT[2] = {2, 3};
 const byte RADIO_MSG_SLAVE_CELL_FREE[2] = {4, 5};
 const byte RADIO_MSG_SLAVE_CELL_OBSTACLE[2] = {6, 7};
-const byte RADIO_MSG_MASTER_MODE_DIAGNOSE = 10;
-const byte RADIO_MSG_MASTER_MODE_FREESTART = 11;
-const byte RADIO_MSG_MASTER_MODE_KO_SYSTEM_SINGLE = 12;
-const byte RADIO_MSG_MASTER_MODE_KO_SYSTEM_DUEL = 13;
 
 // *******************************************************
 // **
@@ -26,7 +36,7 @@ const byte RADIO_MSG_MASTER_MODE_KO_SYSTEM_DUEL = 13;
 // *******************************************************
 
 const int PIN_CELL = A0;
-const int PIN_LASER = 2;
+const int PIN_LASER = 3;
 const int PIN_OUT_LED_MASTER_HEARTBEAT = 4;
 const int PIN_OUT_BUZZER = 6;
 
@@ -35,10 +45,17 @@ const int PIN_OUT_BUZZER = 6;
 // ** OTHER DECLARATIONS
 // **
 // *******************************************************
+MyMessage msgHeartbeat(RADIO_MSG_SLAVE_HEARTBEAT[SLAVE_ID], V_DISTANCE);
+MyMessage msgCellFree(RADIO_MSG_SLAVE_CELL_FREE[SLAVE_ID], V_STATUS);
+MyMessage msgCellObstacle(RADIO_MSG_SLAVE_CELL_OBSTACLE[SLAVE_ID], V_STATUS);
+MyMessage msgCellSetThreshold(RADIO_MSG_SET_THRESHOLD[SLAVE_ID], V_DISTANCE);
+MyMessage msgCellReset(RADIO_MSG_RESET[SLAVE_ID], V_STATUS);
+
 const int HEARTBEAT_PERIOD = 500 + (SLAVE_ID * 5);
-const int CELL_VALUE_DELTA = 30;
 unsigned long lastHeartBeatTime = 0;
-int defaultCellValue;
+int cellValueThreshold = 50;
+int minCellValue;
+int maxCellValue;				  // LDR value when hightlighted by the laser
 bool evenMasterHeartbeat = false; // even / odd flag toggled each time a heartbeat is received from the master module
 unsigned long masterLastHeartBeatTime = 0;
 unsigned long hbId = 0;
@@ -54,27 +71,31 @@ cellStatusEnum lastCellStatus = cellStatusUnknown;
 
 // *******************************************************
 // **
+// ** PRESENTATION
+// **
+// *******************************************************
+void presentation()
+{
+	// Send the sketch version information to the gateway
+	sendSketchInfo("Slave", "1.0");
+
+	// present(RADIO_MSG_SLAVE_HEARTBEAT[SLAVE_ID], S_BINARY);
+	// present(RADIO_MSG_SLAVE_CELL_FREE[SLAVE_ID], S_BINARY);
+	// present(RADIO_MSG_SLAVE_CELL_OBSTACLE[SLAVE_ID], S_BINARY);
+	// present(RADIO_MSG_SET_THRESHOLD[SLAVE_ID], S_DISTANCE);
+	// present(RADIO_MSG_RESET[SLAVE_ID], S_DISTANCE);
+}
+
+// *******************************************************
+// **
 // ** SETUP
 // **
 // *******************************************************
 void setup()
 {
-	Serial.begin(9600);
 	Serial.print("SlaveId = ");
 	Serial.println(SLAVE_ID);
 	pinMode(PIN_OUT_BUZZER, OUTPUT);
-
-	Mirf.cePin = 9;				 // Broche CE sur D9
-	Mirf.csnPin = 10;			 // Broche CSuN sur D10
-	Mirf.spi = &MirfHardwareSpi; // On veut utiliser le port SPI hardware
-	Mirf.init();				 // Initialise la bibliothèque
-
-	Mirf.channel = 1;			 // Choix du canal de communication (128 canaux disponibles, de 0 à 127)
-	Mirf.payload = sizeof(byte); // Taille d'un message (maximum 32 octets)
-	Mirf.config();				 // Sauvegarde la configuration dans le module radio
-
-	Mirf.setTADDR((byte *)"nrf02"); // Adresse de transmission
-	Mirf.setRADDR((byte *)"nrf01"); // Adresse de réception
 
 	// ----- Initialization of the cells
 	pinMode(PIN_OUT_LED_MASTER_HEARTBEAT, OUTPUT);
@@ -82,13 +103,15 @@ void setup()
 	pinMode(PIN_CELL, INPUT);
 	Serial.println("Starting...");
 	// Make sure the led is off
-	Serial.print("Default value = ");
 	digitalWrite(PIN_LASER, LOW);
-	defaultCellValue = readCellValue();
-	Serial.println(defaultCellValue);
 	delay(100);
-	// Only switch on the first laser
+	minCellValue = readCellValue();
 	digitalWrite(PIN_LASER, HIGH);
+	delay(100);
+	maxCellValue = readCellValue();
+	Serial.print(minCellValue);
+	Serial.print(" <= value <= ");
+	Serial.println(maxCellValue);
 }
 
 // *******************************************************
@@ -96,13 +119,53 @@ void setup()
 // ** RADIO
 // **
 // *******************************************************
-void sendRadioMessageToMaster(byte value)
+
+void ackMessageFromServer() {
+	for(int i = 0; i < 5; i++) {
+		digitalWrite(PIN_LASER, LOW);
+		delay(200);
+		digitalWrite(PIN_LASER, HIGH);
+		delay(50);
+	}
+}
+
+void(* resetFunc) (void) = 0; //declare reset function @ address 0
+
+/*
+   Read incoming data from the radio module (receive data from the slave module)
+*/
+void receive(const MyMessage &message)
 {
-	byte message[1];
-	message[0] = value;
-	Mirf.send(message); // (byte *) &value);
-	while (Mirf.isSending())
-		;
+	Serial.println("RECEIVE");
+	if (message.sensor == RADIO_MSG_RESET)
+	{
+		ackMessageFromServer();
+		setup();
+		// Ack to server
+		send(msgCellReset.set(1));
+	}
+	else if (message.sensor == RADIO_MSG_SET_THRESHOLD[SLAVE_ID])
+	{
+		ackMessageFromServer();
+		cellValueThreshold = message.getInt();
+		Serial.print(">>>>>");
+		Serial.println(cellValueThreshold);
+		// Ack to server
+		send(msgCellSetThreshold.set(cellValueThreshold));
+	}
+	else if (message.sensor == RADIO_MSG_RESET[SLAVE_ID])
+	{
+		ackMessageFromServer();
+		Serial.println("RESET");
+		// Ack to server
+		send(msgCellReset.set(1));
+		resetFunc();
+	}
+	else
+	{
+		Serial.print("Ignoring radio message ");
+		Serial.println(message.sensor);
+	}
 }
 
 void sendRadioHeartBeatIfNeeded()
@@ -110,37 +173,10 @@ void sendRadioHeartBeatIfNeeded()
 	unsigned long now = millis();
 	if (now - lastHeartBeatTime > HEARTBEAT_PERIOD)
 	{
-		sendRadioMessageToMaster(RADIO_MSG_SLAVE_HEARTBEAT[SLAVE_ID]);
 		lastHeartBeatTime = now;
+		send(msgHeartbeat.set(++hbId));
 		Serial.print("hb sent : ");
-		Serial.println(hbId++);
-	}
-}
-
-void readFromRadio()
-{
-	byte message[1];
-	if (!Mirf.isSending() && Mirf.dataReady())
-	{
-		Mirf.getData(message);
-		switch (message[0])
-		{
-		case RADIO_MSG_MASTER_HEARTBEAT: // heartbeat from master
-			Serial.println("<hb_master>");
-			evenMasterHeartbeat = !evenMasterHeartbeat;
-			digitalWrite(PIN_OUT_LED_MASTER_HEARTBEAT, evenMasterHeartbeat ? HIGH : LOW);
-			masterLastHeartBeatTime = millis();
-			break;
-		case RADIO_MSG_MASTER_MODE_FREESTART:
-			break;
-		case RADIO_MSG_MASTER_MODE_KO_SYSTEM_SINGLE:
-			break;
-		case RADIO_MSG_MASTER_MODE_KO_SYSTEM_DUEL:
-			break;
-		default:
-			Serial.println("Ignored");
-			break;
-		}
+		Serial.println(hbId);
 	}
 }
 
@@ -160,12 +196,12 @@ void sendCellStatus(cellStatusEnum cellStatus)
 	switch (cellStatus)
 	{
 	case cellStatusFree:
+		send(msgCellFree.set(1));
 		Serial.println("Send : free");
-		sendRadioMessageToMaster(RADIO_MSG_SLAVE_CELL_FREE[SLAVE_ID]);
 		break;
 	case cellStatusObstacle:
+		send(msgCellObstacle.set(1));
 		Serial.println("Send : obstacle");
-		sendRadioMessageToMaster(RADIO_MSG_SLAVE_CELL_OBSTACLE[SLAVE_ID]);
 		beep(50);
 		break;
 	}
@@ -174,11 +210,13 @@ void sendCellStatus(cellStatusEnum cellStatus)
 void checkCellStatus()
 {
 	int val = readCellValue();
+	//Serial.println(val);
 	cellStatusEnum cellStatus = cellStatusUnknown;
-	if (val > defaultCellValue + CELL_VALUE_DELTA)
-		cellStatus = cellStatusFree;
-	else
+	if (val <= minCellValue + cellValueThreshold) {
 		cellStatus = cellStatusObstacle;
+	}
+	else
+		cellStatus = cellStatusFree;
 	if (cellStatus == lastCellStatus)
 	{
 		// nothing changed
@@ -196,10 +234,12 @@ void checkCellStatus()
 // *******************************************************
 void beep(unsigned char delayms)
 {
-	analogWrite(PIN_OUT_BUZZER, 20);
-	delay(delayms);
-	analogWrite(PIN_OUT_BUZZER, 0);
-	delay(delayms);
+	/*
+    analogWrite(PIN_OUT_BUZZER, 20);
+    delay(delayms);
+    analogWrite(PIN_OUT_BUZZER, 0);
+    delay(delayms);
+  */
 }
 
 // *******************************************************
@@ -211,5 +251,4 @@ void loop()
 {
 	sendRadioHeartBeatIfNeeded();
 	checkCellStatus();
-	readFromRadio();
 }
