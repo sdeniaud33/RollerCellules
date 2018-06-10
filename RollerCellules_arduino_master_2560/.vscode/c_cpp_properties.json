@@ -3,17 +3,21 @@
         {
             "name": "Win32",
             "includePath": [
-                "C:\\Users\\stden\\AppData\\Local\\Arduino15\\packages\\arduino\\hardware\\avr\\1.6.20\\cores\\arduino"
+                "C:\\Users\\stden\\AppData\\Local\\Arduino15\\packages\\arduino\\hardware\\avr\\1.6.20\\cores\\arduino",
+                "C:\\Users\\stden\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\2.3.0\\cores\\esp8266"
             ],
             "browse": {
                 "limitSymbolsToIncludedHeaders": false,
                 "path": [
                     "C:\\Users\\stden\\AppData\\Local\\Arduino15\\packages\\arduino\\hardware\\avr\\1.6.20\\cores\\arduino",
-                    "${workspaceRoot}"
+                    "${workspaceRoot}",
+                    "C:\\Users\\stden\\AppData\\Local\\Arduino15\\packages\\esp8266\\hardware\\esp8266\\2.3.0\\cores\\esp8266"
                 ]
             },
-            "intelliSenseMode": "msvc-x64"
+            "intelliSenseMode": "msvc-x64",
+            "cStandard": "c11",
+            "cppStandard": "c++17"
         }
     ],
-    "version": 3
+    "version": 4
 }
